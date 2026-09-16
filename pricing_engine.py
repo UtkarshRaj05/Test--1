@@ -27,8 +27,9 @@ Run this file directly to see a worked Friday-night example, including
 a sold-out tier being correctly rejected.
 """
 
+import re
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import Dict, List, Optional
 
 
@@ -113,6 +114,151 @@ class Show:
         if name not in self.tiers:
             raise UnknownTierError(f"No such tier at this counter: {name!r}")
         return self.tiers[name]
+
+
+# ---------------------------------------------------------------------------
+# messy price-list import
+# ---------------------------------------------------------------------------
+#
+# Real price feeds from box-office systems, spreadsheets and vendor exports
+# are never clean: the same tier shows up under different capitalisations,
+# prices arrive as "150", "₹150.00", "Rs. 250/-", "1,200", or "INR 700",
+# some fields are just blank, and typos produce stray negative prices.
+# This step turns that mess into a trustworthy SeatTier list, plus a full
+# audit trail of what happened to every row.
+
+def parse_price(raw) -> Optional[Decimal]:
+    """Parse a messy price string into a Decimal, or None if it can't be read.
+    Strips ₹ / Rs. / Rs / INR prefixes, trailing '/-', commas and whitespace."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s == "":
+        return None
+    s = s.replace("₹", "").replace(",", "")
+    s = re.sub(r"(?i)^\s*(rs\.?|inr)\s*", "", s)   # leading "Rs.", "Rs", "INR"
+    s = re.sub(r"(?i)\s*(rs\.?|inr)\s*$", "", s)   # trailing, just in case
+    s = re.sub(r"/-\s*$", "", s)                    # trailing "/-"
+    s = s.strip()
+    if s == "":
+        return None
+    try:
+        return Decimal(s)
+    except InvalidOperation:
+        return None
+
+
+def parse_seats(raw) -> Optional[int]:
+    """Parse a messy seat-count field into an int, or None if it can't be read."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s == "":
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
+@dataclass
+class ImportReport:
+    imported: List[SeatTier] = field(default_factory=list)
+    deduplicated: List[str] = field(default_factory=list)
+    rejected: List[str] = field(default_factory=list)
+
+    def render(self) -> str:
+        w = 66
+        out = ["PRICE LIST IMPORT REPORT", "=" * w]
+        out.append(f"Imported — {len(self.imported)} clean tier(s):")
+        for t in self.imported:
+            out.append(f"  ✓ {t.name:<14}{rupees(t.price):>10}   {t.total_seats} seat(s)")
+        out.append("")
+        out.append(f"De-duplicated — {len(self.deduplicated)} row(s) merged away:")
+        for note in self.deduplicated:
+            out.append(f"  ~ {note}")
+        if not self.deduplicated:
+            out.append("  (none)")
+        out.append("")
+        out.append(f"Rejected — {len(self.rejected)} row(s) thrown out:")
+        for note in self.rejected:
+            out.append(f"  ✗ {note}")
+        if not self.rejected:
+            out.append("  (none)")
+        out.append("=" * w)
+        return "\n".join(out)
+
+
+def import_seat_price_list(raw_rows: List[dict]) -> ImportReport:
+    """
+    Clean a messy raw price-list feed into a de-duplicated, validated list
+    of SeatTiers, with a full report of what was imported, merged, or
+    rejected and why.
+
+    Each raw row is a dict with (possibly messy) keys: "tier", "price", "seats".
+
+    Dedup rule: tier names are matched case-insensitively after trimming
+    whitespace. The first valid row for a given name wins. A later row for
+    the same name is:
+      - merged away ("deduplicated") if its price matches the first row, or
+      - rejected as a conflict if its price differs from the first row.
+    """
+    report = ImportReport()
+    canon: Dict[str, SeatTier] = {}
+
+    for i, row in enumerate(raw_rows, start=1):
+        raw_name, raw_price, raw_seats = row.get("tier"), row.get("price"), row.get("seats")
+        label = f"row {i} (tier={raw_name!r}, price={raw_price!r}, seats={raw_seats!r})"
+
+        name = (raw_name or "").strip()
+        if name == "":
+            report.rejected.append(f"{label}: blank tier name")
+            continue
+
+        price = parse_price(raw_price)
+        if price is None:
+            reason = ("missing price" if raw_price is None or str(raw_price).strip() == ""
+                       else f"unparseable price {raw_price!r}")
+            report.rejected.append(f"{label}: {reason}")
+            continue
+        if price < 0:
+            report.rejected.append(f"{label}: negative price ({rupees(money(price))})")
+            continue
+
+        seats = parse_seats(raw_seats)
+        if seats is None:
+            reason = ("missing seat count" if raw_seats is None or str(raw_seats).strip() == ""
+                       else f"unparseable seat count {raw_seats!r}")
+            report.rejected.append(f"{label}: {reason}")
+            continue
+        if seats <= 0:
+            report.rejected.append(f"{label}: invalid seat count ({seats})")
+            continue
+
+        key = name.lower()
+        canonical_name = name.title()
+        price = money(price)
+
+        if key in canon:
+            existing = canon[key]
+            if price == existing.price:
+                report.deduplicated.append(
+                    f"{label}: duplicate of '{existing.name}' at the same price "
+                    f"({rupees(price)}) — merged, first entry kept"
+                )
+            else:
+                report.rejected.append(
+                    f"{label}: duplicate tier name '{canonical_name}' but conflicting price "
+                    f"({rupees(price)} vs already-imported {rupees(existing.price)}) — "
+                    f"kept the first entry, discarded this row"
+                )
+            continue
+
+        tier = SeatTier(canonical_name, price, seats)
+        canon[key] = tier
+        report.imported.append(tier)
+
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -380,14 +526,32 @@ class PricingEngine:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    show = Show.create(
-        title="Screen 4 · 9:40 PM · War of the Reels",
-        tier_specs=[
-            ("Silver", Decimal("150"), 60),
-            ("Gold", Decimal("250"), 40),
-            ("Recliner", Decimal("450"), 2),   # deliberately almost sold out
-        ],
-    )
+    # ---- Step 0: the messy price list, exactly as it might land from a
+    # vendor export — mixed case duplicates, mixed currency formats,
+    # blanks, and a negative price a typo let slip through.
+    raw_price_list = [
+        {"tier": "Silver",       "price": "150",         "seats": "60"},
+        {"tier": "SILVER",       "price": "₹150.00",     "seats": "60"},   # dup, same price
+        {"tier": "Gold",         "price": "Rs. 250/-",   "seats": "40"},
+        {"tier": "gold ",        "price": "275",         "seats": "40"},   # dup, conflicting price
+        {"tier": "Recliner",     "price": "450.00",      "seats": "2"},
+        {"tier": "RECLINER",     "price": "  450  ",     "seats": "2"},    # dup, same price
+        {"tier": "Balcony",      "price": "",            "seats": "30"},   # blank price
+        {"tier": "   ",          "price": "300",         "seats": "20"},   # blank name
+        {"tier": "VIP",          "price": "-500",        "seats": "10"},   # negative price
+        {"tier": "Economy",      "price": "abc",         "seats": "50"},   # unparseable price
+        {"tier": "Premium",      "price": "1,200",       "seats": "15"},
+        {"tier": "Premium",      "price": "1200.00",     "seats": "15"},   # dup, same price
+        {"tier": "Box",          "price": "600",         "seats": "-5"},   # invalid seat count
+        {"tier": "Couple Seat",  "price": "INR 700",     "seats": ""},     # blank seats
+    ]
+
+    import_report = import_seat_price_list(raw_price_list)
+    print(import_report.render())
+    print()
+
+    show = Show(title="Screen 4 · 9:40 PM · War of the Reels",
+                tiers={t.name: t for t in import_report.imported})
 
     engine = PricingEngine(convenience_fee_per_ticket=Decimal("30"))
 
